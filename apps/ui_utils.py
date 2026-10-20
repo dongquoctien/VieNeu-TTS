@@ -90,7 +90,8 @@ def wrap_with_estimate(synthesize_fn):
                             f"Tổng: {_format_duration(estimated_total)}"
                         )
 
-            yield audio_path, status_text, estimate_text
+            # Short jobs never report progress: hide the box instead of showing it empty.
+            yield audio_path, status_text, gr.update(value=estimate_text, visible=bool(estimate_text))
     return wrapper
 
 def cleanup_gpu_memory():

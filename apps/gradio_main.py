@@ -20,6 +20,7 @@ import queue
 import threading
 import yaml
 import uuid
+import unicodedata
 from vieneu_utils.core_utils import join_audio_chunks, env_bool, get_silence_duration_v2, gaps_to_silence, trust_remote_code_enabled
 from vieneu_utils.phonemize_text import phonemize_to_chunks, normalize_to_chunks, normalize_to_chunks_v3, normalize_to_chunks_v3_with_gaps
 # PuncNormalizer = sea_g2p.Normalizer luôn bật punc_norm=True.
@@ -37,6 +38,7 @@ except ImportError:
 from apps.srt_speech import srt_to_speech
 from apps.user_voices import (
     load_user_voices, save_user_voice, delete_user_voice, list_user_voices, supports_saving,
+    voices_home, USER_MARK,
 )
 from apps.ui_utils import (
     _format_duration,
@@ -177,15 +179,36 @@ PRESET_VOICES_CACHE = []  # List of all voices (tuples or strings)
 CONV_VOICES_CACHE = []    # Filtered list for conversation (podcast=True)
 
 
+USER_VOICE_PREFIX = "💾 "
+
+
+def _vi_sort_key(text: str) -> str:
+    """A-Z key that files Vietnamese letters under their base letter (Đ with D,
+    Ă/Â with A…) instead of after Z, which is where plain code-point order puts them."""
+    text = str(text).replace("Đ", "D").replace("đ", "d")
+    return unicodedata.normalize("NFD", text).encode("ascii", "ignore").decode().casefold()
+
+
 def _sort_voices(tts, voices):
     """Dropdown order: editors' picks (``featured`` 1..N in the voices JSON, already
-    ⭐-labelled by the SDK) first in that order, then everything else A-Z."""
+    ⭐-labelled by the SDK) first in that order, then the voices the user saved from
+    the Voice Cloning tab (💾-labelled here), then everything else A-Z."""
     presets = getattr(tts, "_preset_voices", {}) or {}
+
+    def _entry(v_id):
+        e = presets.get(v_id)
+        return e if isinstance(e, dict) else {}
+
+    for i, v in enumerate(voices):
+        if isinstance(v, tuple) and _entry(v[1]).get(USER_MARK) and not v[0].startswith(USER_VOICE_PREFIX):
+            voices[i] = (USER_VOICE_PREFIX + v[0], v[1])
 
     def _key(v):
         label, v_id = (v[0], v[1]) if isinstance(v, tuple) else (v, v)
-        rank = presets.get(v_id, {}).get("featured") if isinstance(presets.get(v_id), dict) else None
-        return (rank is None, rank or 0, str(label))
+        e = _entry(v_id)
+        rank = e.get("featured")
+        group = 0 if rank is not None else (1 if e.get(USER_MARK) else 2)
+        return (group, rank or 0, _vi_sort_key(label), str(label))
 
     voices.sort(key=_key)
 MAX_SPEAKERS = 8          # Max concurrent speakers in conversation tab
@@ -218,12 +241,33 @@ def _supports_cloning(backbone_choice: str) -> bool:
     c = (backbone_choice or "").lower()
     return "v3" in c or c == "vieneu-tts-v2 (gpu)"
 
+def _v3_runtime_label() -> str:
+    """Where a v3 model actually runs, e.g. ``CPU · ONNX fp32 · 8 luồng`` (v3 picks
+    ONNX on CPU and PyTorch on GPU by itself, so the Device radio alone says little)."""
+    backend = getattr(tts, "backend", None)
+    if backend == "pytorch":
+        return "GPU · PyTorch"
+    parts = ["CPU", "ONNX"]
+    precision = BACKBONE_CONFIGS.get(current_backbone or "", {}).get("precision")
+    if precision:
+        parts[-1] += f" {precision}"
+    threads = getattr(getattr(tts, "engine", None), "ort_intra_op_threads", None) or getattr(tts, "ort_intra_op_threads", None)
+    if threads:
+        parts.append(f"{threads} luồng")
+    return " · ".join(parts)
+
+
 def get_model_status_message() -> str:
     """Reconstruct status message from global state"""
     global model_loaded, tts, using_lmdeploy, current_backbone, current_codec
     if not model_loaded or tts is None:
         return "⏳ Chưa tải model."
-    
+
+    if "v3" in (current_backbone or "").lower():
+        # v3 brings its own codec: the Codec dropdown does not apply, so say only
+        # which model is loaded and where it runs.
+        return f"✅ Đã tải **{current_backbone}** — {_v3_runtime_label()}"
+
     if "v2-Turbo" in (current_backbone or ""):
         backend_name = "⚡ Turbo (v2)"
     elif using_lmdeploy:
@@ -260,22 +304,61 @@ def get_model_status_message() -> str:
             f"\n  • Prefix Caching: ❌"
         )
 
+    # Markdown joins single newlines into one line, so end each line with two spaces.
     return (
-        f"✅ Model đã tải thành công!\n\n"
-        f"🔧 Backend: {backend_name}\n"
-        f" Parrot: {current_backbone} on {device_info}\n"
+        f"✅ Model đã tải thành công!  \n"
+        f"🔧 Backend: {backend_name}  \n"
+        f"🦜 Backbone: {current_backbone} on {device_info}  \n"
         f"🎵 Codec: {current_codec} on {codec_device}{preencoded_note}{opt_info}"
     )
 
+def _supports_conversation(backbone_choice: str) -> bool:
+    """Hội thoại tab: v2 (sequential) and v3 (Turbo batched / Nano sequential)."""
+    bc = backbone_choice or ""
+    return bc in ("VieNeu-TTS-v2 (GPU)", "VieNeu-TTS-v2 (CPU)") or "v3" in bc.lower()
+
+
+def _batch_controls_visible() -> bool:
+    """Batch Processing / Batch Size only act on a GPU backend; on CPU/ONNX they
+    are ignored, so they are hidden there instead of sitting on every tab."""
+    if not HAS_GPU:
+        return False
+    if not model_loaded or tts is None:
+        return True
+    return getattr(tts, "backend", None) != "onnx" and "nano" not in (current_backbone or "").lower()
+
+
 def restore_ui_state():
-    """Update UI components based on persistence"""
-    global model_loaded
+    """Rebuild the model-dependent controls for a freshly opened page (F5, a new
+    tab) from the model this process already holds. Without it the page said the
+    model was loaded while the voice list was empty and the Hội thoại tab hidden,
+    so Bắt đầu failed with "Vui lòng chọn giọng mẫu"."""
+    loaded = bool(model_loaded and tts is not None)
     msg = get_model_status_message()
+    keep = gr.update()
+    backbone_update = voice_update = tab_custom_update = conv_tab_update = slot_update = keep
+    if loaded:
+        if current_backbone in BACKBONE_CONFIGS:
+            backbone_update = gr.update(value=current_backbone)
+        tab_custom_update = gr.update(visible=_supports_cloning(current_backbone))
+        conv_tab_update = gr.update(visible=_supports_conversation(current_backbone))
+        if PRESET_VOICES_CACHE:
+            values = [v[1] if isinstance(v, tuple) else v for v in PRESET_VOICES_CACHE]
+            default_v = getattr(tts, "_default_voice", None)
+            if default_v not in values:
+                default_v = values[0]
+            voice_update = gr.update(choices=PRESET_VOICES_CACHE, value=default_v, interactive=True)
+            slot_update = gr.update(choices=CONV_VOICES_CACHE)
     return (
-        msg, 
-        gr.update(interactive=model_loaded), # btn_generate
-        gr.update(interactive=model_loaded), # btn_generate_conv
-        gr.update(interactive=False)         # btn_stop
+        msg,
+        gr.update(interactive=loaded), # btn_generate
+        gr.update(interactive=loaded), # btn_generate_conv
+        gr.update(interactive=False),  # btn_stop
+        backbone_update,
+        voice_update,
+        tab_custom_update,
+        conv_tab_update,
+        *([slot_update] * MAX_SPEAKERS),
     )
 
 def should_use_lmdeploy(backbone_choice: str, device_choice: str) -> bool:
@@ -800,9 +883,7 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
             tab_c = gr.update(visible=_supports_cloning(backbone_choice))
 
         # Conversation tab: available for v2 (sequential) and v3 Turbo (batched).
-        is_v2 = (backbone_choice == "VieNeu-TTS-v2 (GPU)" or backbone_choice == "VieNeu-TTS-v2 (CPU)")
-        is_v3_conv = "v3" in (backbone_choice or "").lower()
-        conv_tab_update = gr.update(visible=is_v2 or is_v3_conv)
+        conv_tab_update = gr.update(visible=_supports_conversation(backbone_choice))
 
         # Update all MAX_SPEAKERS slot dropdowns
         slot_updates = [slot_dd_update] * MAX_SPEAKERS
@@ -1392,7 +1473,7 @@ synthesize_speech_with_estimate = wrap_with_estimate(synthesize_speech)
 
 def synthesize_conversation_with_empty_estimate(*args):
     for audio_path, status in synthesize_conversation(*args):
-        yield audio_path, status, ""
+        yield audio_path, status, gr.update(value="", visible=False)
 
 # --- CANCELLATION ---
 # threading.Event is a mutable object: never reassigned, always the same reference.
@@ -1888,11 +1969,13 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                     value=default_backbone,
                     label="🦜 Backbone"
                 )
+                # v3 ships its own codec, so the (read-only) Codec box only shows for v1/v2.
                 codec_select = gr.Dropdown(
-                    list(CODEC_CONFIGS.keys()), 
-                    value=default_codec, 
+                    list(CODEC_CONFIGS.keys()),
+                    value=default_codec,
                     label="🎵 Codec",
-                    interactive=False
+                    interactive=False,
+                    visible="v3" not in default_backbone.lower(),
                 )
                 device_choice = gr.Radio(get_available_devices(), value="Auto", label="🖥️ Device")
             
@@ -1929,45 +2012,49 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                 )
             
             
-            gr.Markdown("""
-            💡 **Sử dụng Custom Model:** Chọn "Custom Model" để tải LoRA adapter hoặc bất kỳ model nào được finetune từ **VieNeu-TTS** hoặc **VieNeu-TTS-0.3B**.
-            """)
-            
-            gr.HTML("""
-            <div class="warning-banner">
-                <div class="warning-banner-title">
-                    🦜 Gợi ý tối ưu hiệu năng
-                </div>
-                <div class="warning-banner-grid">
-                    <div class="warning-banner-item">
-                        <strong>🐆 Hệ máy GPU</strong>
-                        <div class="warning-banner-content">
-                            <b>VieNeu-TTS-v3-Turbo</b> — 48kHz, giọng mặc định ổn định, Voice Cloning và hỗ trợ các tag cảm xúc `[cười]` `[hắng giọng]` `[thở dài]` (riêng tag cảm xúc vẫn đang thử nghiệm). Nếu gặp lỗi hãy báo với chúng tôi tại: https://discord.com/invite/yJt8kzjzWZ.
+            with gr.Row(equal_height=True):
+                btn_load = gr.Button("🔄 Tải Model", variant="primary", scale=1, min_width=160)
+                model_status = gr.Markdown("⏳ Chưa tải model.", elem_classes="model-status")
+
+            # Tips and release notes stay one click away instead of pushing the
+            # workspace below the fold on a laptop screen.
+            with gr.Accordion("💡 Gợi ý chọn model & tin mới", open=False):
+                gr.Markdown("""
+                💡 **Sử dụng Custom Model:** Chọn "Custom Model" để tải LoRA adapter hoặc bất kỳ model nào được finetune từ **VieNeu-TTS** hoặc **VieNeu-TTS-0.3B**.
+                """)
+
+                gr.HTML("""
+                <div class="warning-banner">
+                    <div class="warning-banner-title">
+                        🦜 Gợi ý tối ưu hiệu năng
+                    </div>
+                    <div class="warning-banner-grid">
+                        <div class="warning-banner-item">
+                            <strong>🐆 Hệ máy GPU</strong>
+                            <div class="warning-banner-content">
+                                <b>VieNeu-TTS-v3-Turbo</b> — 48kHz, giọng mặc định ổn định, Voice Cloning và hỗ trợ các tag cảm xúc `[cười]` `[hắng giọng]` `[thở dài]` (riêng tag cảm xúc vẫn đang thử nghiệm). Nếu gặp lỗi hãy báo với chúng tôi tại: https://discord.com/invite/yJt8kzjzWZ.
+                            </div>
+                        </div>
+                        <div class="warning-banner-item" style="background: #dcfce7; border-color: #86efac;">
+                            <strong style="color: #15803d;">🐢 Hệ máy CPU</strong>
+                            <div class="warning-banner-content" style="color: #166534;">
+                                Máy <b>CPU</b> dùng bản mặc định <b>VieNeu-TTS-v3-Turbo</b> (ONNX, chất lượng tối đa). Bản <b>VieNeu-TTS-v3-Nano (preview)</b> chạy rất nhanh, dành cho edge device như Android hoặc CPU yếu, nhưng <b>chất lượng kém hơn nhiều</b> so với Turbo (nhất là tiếng Anh, song ngữ) — chỉ dùng khi thực sự cần tốc độ hoặc deploy trên điện thoại. Nano đang trong quá trình thử nghiệm nên còn nhiều thiếu sót.
+                            </div>
                         </div>
                     </div>
-                    <div class="warning-banner-item" style="background: #dcfce7; border-color: #86efac;">
-                        <strong style="color: #15803d;">🐢 Hệ máy CPU</strong>
-                        <div class="warning-banner-content" style="color: #166534;">
-                            Máy <b>CPU</b> dùng bản mặc định <b>VieNeu-TTS-v3-Turbo</b> (ONNX, chất lượng tối đa). Bản <b>VieNeu-TTS-v3-Nano (preview)</b> chạy rất nhanh, dành cho edge device như Android hoặc CPU yếu, nhưng <b>chất lượng kém hơn nhiều</b> so với Turbo (nhất là tiếng Anh, song ngữ) — chỉ dùng khi thực sự cần tốc độ hoặc deploy trên điện thoại. Nano đang trong quá trình thử nghiệm nên còn nhiều thiếu sót.
-                        </div>
+                    <div style="margin-top: 12px; font-size: 0.85rem; color: #92400e; border-top: 1px dashed #fcd34d; padding-top: 8px;">
+                        💡 <b>Mẹo:</b> Nếu máy bạn có GPU mà không thấy các phiên bản GPU hãy xem lại cách cài đặt uv sync --group gpu
                     </div>
                 </div>
-                <div style="margin-top: 12px; font-size: 0.85rem; color: #92400e; border-top: 1px dashed #fcd34d; padding-top: 8px;">
-                    💡 <b>Mẹo:</b> Nếu máy bạn có GPU mà không thấy các phiên bản GPU hãy xem lại cách cài đặt uv sync --group gpu
-                </div>
-            </div>
-            """)
+                """)
 
-            gr.Markdown(
-                "🆕 **VieNeu-TTS-v3-Turbo** đã **phát hành chính thức** — "
-                "48kHz, giọng mặc định ổn định, **hỗ trợ Voice Cloning** (tính năng clone chỉ có từ **v3** trở lên; v1/v2 không hỗ trợ).\n\n"
-                "🎭 v3 Turbo **hỗ trợ các tag cảm xúc** `[cười]` `[hắng giọng]` `[thở dài]` "
-                "(chèn trực tiếp vào văn bản) — riêng tính năng này vẫn **đang thử nghiệm**."
-            )
+                gr.Markdown(
+                    "🆕 **VieNeu-TTS-v3-Turbo** đã **phát hành chính thức** — "
+                    "48kHz, giọng mặc định ổn định, **hỗ trợ Voice Cloning** (tính năng clone chỉ có từ **v3** trở lên; v1/v2 không hỗ trợ).\n\n"
+                    "🎭 v3 Turbo **hỗ trợ các tag cảm xúc** `[cười]` `[hắng giọng]` `[thở dài]` "
+                    "(chèn trực tiếp vào văn bản) — riêng tính năng này vẫn **đang thử nghiệm**."
+                )
 
-            btn_load = gr.Button("🔄 Tải Model", variant="primary")
-            model_status = gr.Markdown("⏳ Chưa tải model.")
-        
         with gr.Row(elem_classes="container"):
             # --- INPUT ---
             with gr.Column(scale=3):
@@ -1999,10 +2086,13 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                             choices=[], value=None, label="Giọng mẫu", allow_custom_value=True,
                             info="Giọng bạn lưu ở tab Voice Cloning cũng nằm trong danh sách này.",
                         )
+                        # Only one mode exists today; kept (hidden) because the synthesis
+                        # handlers still take it as an input.
                         generation_mode = gr.Radio(
                             ["Standard (Một lần)"],
                             value="Standard (Một lần)",
-                            label="Chế độ sinh"
+                            label="Chế độ sinh",
+                            visible=False,
                         )
                         btn_generate = gr.Button("🎵 Bắt đầu", variant="primary", scale=2, interactive=False)
 
@@ -2028,22 +2118,24 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                         speaker_slot_rows  = []
 
                         for _i in range(MAX_SPEAKERS):
-                            # Mặc định cho 3 nhân vật đầu tiên theo yêu cầu
+                            # Mặc định cho 3 nhân vật đầu tiên theo yêu cầu — giọng là ID thật
+                            # của v3 Turbo (khớp bảng overrides trong extract_speakers_from_script);
+                            # "Ly"/"Binh"/"Sơn" cũ không phải giọng nào cả.
                             _default_name = ""
                             _default_voice = None
                             _row_visible = False
-                            
+
                             if _i == 0:
                                 _default_name = "Phương"
-                                _default_voice = "Ly"
+                                _default_voice = "Trúc Ly"
                                 _row_visible = True
                             elif _i == 1:
                                 _default_name = "Dũng"
-                                _default_voice = "Binh"
+                                _default_voice = "Thanh Bình"
                                 _row_visible = True
                             elif _i == 2:
                                 _default_name = "Hùng"
-                                _default_voice = "Sơn"
+                                _default_voice = "Thái Sơn"
                                 _row_visible = True
                             elif _i < 2:
                                 _default_name = f"Nhân vật {_i+1}"
@@ -2112,10 +2204,10 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                             "reference transcript để clone giọng."
                             if _default_is_v2_gpu else
                             "ℹ️ **Voice Cloning (VieNeu-TTS v3).** Chỉ cần tải lên audio mẫu "
-                            "3–5 giây; v3 clone trực tiếp từ audio, không cần nhập nội dung."
+                            "3–5 giây (tối đa 8 giây); v3 clone trực tiếp từ audio, không cần nhập nội dung."
                         )
                         with gr.Group(visible=True) as cloning_elements_group:
-                            custom_audio = gr.Audio(label="Audio giọng mẫu (3-5 giây) (.wav)", type="filepath")
+                            custom_audio = gr.Audio(label="Audio giọng mẫu (lý tưởng 3–5 giây, tối đa 8 giây)", type="filepath")
                             cloning_warning_msg = gr.Markdown(visible=False, elem_id="cloning-warning")
                             denoise_checkbox = gr.Checkbox(
                                 value=True, label="🔇 Denoise audio mẫu",
@@ -2164,7 +2256,8 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                             gr.Markdown(
                                 "Đặt tên rồi bấm **Lưu giọng**: giọng sẽ có trong danh sách giọng mẫu của "
                                 "**Đọc truyện, Hội thoại, SRT** và được giữ lại cho những lần mở app sau "
-                                "(lưu trong thư mục `~/.vieneu`). Chỉ VieNeu v3 (Turbo / Nano) lưu được."
+                                f"(lưu trong thư mục `{voices_home()}`, đổi bằng biến `VIENEU_HOME`). "
+                                "Chỉ VieNeu v3 (Turbo / Nano) lưu được."
                             )
                             # Inputs on one line, the action button on its own line at its
                             # natural size: a button stretched to the height of two labelled
@@ -2178,11 +2271,12 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                             # control tall, so a small delete button lines up with it.
                             gr.Markdown("**Giọng đã lưu**", elem_classes="field-caption")
                             with gr.Row(elem_classes="inline-row"):
-                                user_voice_dd = gr.Dropdown(choices=[], value=None, show_label=False, container=False, scale=4)
+                                user_voice_dd = gr.Dropdown(choices=[], value=None, label="Giọng đã lưu", show_label=False, container=False, scale=4)
                                 btn_delete_voice = gr.Button("🗑️ Xoá", variant="secondary", size="sm", scale=0, min_width=110)
 
-                # Global Generation Settings
-                with gr.Row():
+                # Global Generation Settings — batching only acts on a GPU backend,
+                # so the row is hidden on CPU (see _batch_controls_visible).
+                with gr.Row(visible=_batch_controls_visible()) as batch_row:
                     use_batch = gr.Checkbox(
                         value=True, 
                         label="⚡ Batch Processing",
@@ -2221,10 +2315,13 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             
             # --- OUTPUT ---
             with gr.Column(scale=2):
+                # Output only: an interactive Audio shows "Drop Audio Here / Click to
+                # Upload", which reads as an input slot.
                 audio_output = gr.Audio(
                     label="Kết quả",
                     type="filepath",
-                    autoplay=True
+                    autoplay=True,
+                    interactive=False,
                 )
                 with gr.Group():
                     status_output = gr.Textbox(
@@ -2234,14 +2331,15 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                         max_lines=10,
                         show_copy_button=True
                     )
-                with gr.Group():
-                    estimate_output = gr.Textbox(
-                        label="Ước tính thời gian",
-                        elem_classes="estimate-box",
-                        lines=2,
-                        max_lines=4,
-                        show_copy_button=True
-                    )
+                # Shown by wrap_with_estimate only while a long job reports progress.
+                estimate_output = gr.Textbox(
+                    label="Ước tính thời gian",
+                    elem_classes="estimate-box",
+                    lines=2,
+                    max_lines=4,
+                    show_copy_button=True,
+                    visible=False,
+                )
                 download_btn = gr.DownloadButton(
                     "📥 Tải xuống file Audio",
                     variant="primary",
@@ -2289,19 +2387,20 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             # 2. Parameter logic
             if is_v3:
                 # v3 Turbo uses its own MOSS codec (PyTorch); 0.8 khớp bản tham chiếu.
-                codec_update = gr.update(value="VieNeu-Codec", interactive=False)
+                # The Codec box does not apply to v3, so it is hidden.
+                codec_update = gr.update(value="VieNeu-Codec", interactive=False, visible=False)
                 text_update = gr.update()  # ô văn bản để trống, không điền mẫu
                 temp_update = gr.update(value=0.8)
             elif "Turbo" in choice:
-                codec_update = gr.update(value="VieNeu-Codec", interactive=False)
+                codec_update = gr.update(value="VieNeu-Codec", interactive=False, visible=True)
                 text_update = gr.update()  # ô văn bản để trống, không điền mẫu
                 temp_update = gr.update(value=0.4)
             elif "(CPU)" in choice:
-                codec_update = gr.update(value="NeuCodec (ONNX)", interactive=False)
+                codec_update = gr.update(value="NeuCodec (ONNX)", interactive=False, visible=True)
                 text_update = gr.update()  # ô văn bản để trống, không điền mẫu
                 temp_update = gr.update(value=0.7)
             else:
-                codec_update = gr.update(value="NeuCodec (Distill)", interactive=False)
+                codec_update = gr.update(value="NeuCodec (Distill)", interactive=False, visible=True)
                 text_update = gr.update()  # ô văn bản để trống, không điền mẫu
                 temp_update = gr.update(value=0.7)
 
@@ -2315,7 +2414,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             else:
                 clone_info_update = gr.update(value=(
                     "ℹ️ **Voice Cloning (VieNeu-TTS v3).** Chỉ cần tải lên audio mẫu "
-                    "3–5 giây; v3 clone trực tiếp từ audio, không cần nhập nội dung."
+                    "3–5 giây (tối đa 8 giây); v3 clone trực tiếp từ audio, không cần nhập nội dung."
                 ))
 
             return (
@@ -2376,10 +2475,11 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             return gr.update(choices=names, value=names[0] if names else None)
 
         def _after_model_load():
-            return gr.update(interactive=bool(model_loaded)), _user_voice_choices()
+            return (gr.update(interactive=bool(model_loaded)), _user_voice_choices(),
+                    gr.update(visible=_batch_controls_visible()))
 
         btn_load.click(lambda: gr.update(interactive=False), outputs=btn_generate_clone)
-        load_event.then(_after_model_load, outputs=[btn_generate_clone, user_voice_dd])
+        load_event.then(_after_model_load, outputs=[btn_generate_clone, user_voice_dd, batch_row])
         
         # --- PDF Upload Event Handlers ---
         def on_pdf_upload(pdf_file):
@@ -2537,7 +2637,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
         def request_stop():
             print("🛑 STOP REQUESTED via button click.")
             _STOP_EVENT.set()
-            return None, "⏹️ Đã dừng tạo giọng nói.", "", gr.update(interactive=False)
+            return None, "⏹️ Đã dừng tạo giọng nói.", gr.update(value="", visible=False), gr.update(interactive=False)
 
         # Handler: set stop event + update UI
         # Note: We avoid cancels= here to prevent internal Gradio KeyError crashes,
@@ -2570,10 +2670,13 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             opens so the tab needs no plumbing into the model-load handler."""
             if not model_loaded or tts is None:
                 return gr.update(choices=[], value=None), gr.update(interactive=False)
-            try:
-                voices = tts.list_preset_voices()
-            except Exception:
-                voices = []
+            # Same sorted, 💾-marked list as the other tabs.
+            voices = list(PRESET_VOICES_CACHE)
+            if not voices:
+                try:
+                    voices = tts.list_preset_voices()
+                except Exception:
+                    voices = []
             default_v = getattr(tts, "_default_voice", None)
             values = [v[1] if isinstance(v, tuple) else v for v in voices]
             if default_v not in values and values:
@@ -2605,13 +2708,44 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             outputs=[download_btn]
         )
 
-        # Persistence: Restore UI state on load
+        # Persistence: a fresh page (F5, new tab, VIENEU_AUTOLOAD) picks up the model
+        # this process already holds — status, backbone, voice lists and tabs.
         demo.load(
             fn=restore_ui_state,
-            outputs=[model_status, btn_generate, btn_generate_conv, btn_stop]
-        ).then(_after_model_load, outputs=[btn_generate_clone, user_voice_dd])
+            outputs=[model_status, btn_generate, btn_generate_conv, btn_stop,
+                     backbone_select, voice_select, tab_custom, conv_tab, *speaker_voice_dds]
+        ).then(_after_model_load, outputs=[btn_generate_clone, user_voice_dd, batch_row])
+
+def _default_codec_for(backbone_choice: str) -> str:
+    """Codec the UI pairs with a backbone (mirrors the default/on_backbone_change logic)."""
+    if "v3" in backbone_choice.lower() or "Turbo" in backbone_choice:
+        return "VieNeu-Codec"
+    if "(CPU)" in backbone_choice:
+        return "NeuCodec (ONNX)"
+    return "NeuCodec (Distill)"
+
+
+def _autoload_model(backbone_choice: str = "") -> None:
+    """Load a model before the UI opens (VIENEU_AUTOLOAD=1). The page then restores
+    it through demo.load, so nobody has to press "Tải Model" after every restart."""
+    choice = backbone_choice or list(BACKBONE_CONFIGS.keys())[0]
+    if choice not in BACKBONE_CONFIGS:
+        print(f"⚠️  VIENEU_BACKBONE='{choice}' không có trong danh sách: {', '.join(BACKBONE_CONFIGS)}. Bỏ qua tự tải model.")
+        return
+    print(f"⏳ VIENEU_AUTOLOAD: đang tải {choice}...")
+    last = None
+    # force_lmdeploy=True matches the checkbox default; v3 ignores it.
+    for last in load_model(choice, _default_codec_for(choice), "Auto", True):
+        pass
+    status = get_model_status_message() if model_loaded else (last[0] if last else "không rõ lỗi")
+    print(f"   {status.replace('**', '')}")  # status is Markdown; print it plain
+
 
 def main():
+    # VIENEU_AUTOLOAD=1 → tải sẵn model khi khởi động (VIENEU_BACKBONE chọn model, mặc định là mục đầu tiên).
+    if env_bool("VIENEU_AUTOLOAD", default=False):
+        _autoload_model(os.getenv("VIENEU_BACKBONE", "").strip())
+
     # Cho phép override từ biến môi trường (hữu ích cho Docker)
     server_name = os.getenv("GRADIO_SERVER_NAME", "127.0.0.1")
     server_port = int(os.getenv("GRADIO_SERVER_PORT", "7860"))
