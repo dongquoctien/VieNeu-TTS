@@ -19,17 +19,27 @@ css = """
 .inline-row { align-items: center; }
 .header-box {
     text-align: center;
-    margin-bottom: 25px;
-    padding: 25px;
+    margin-bottom: 12px;
+    padding: 14px 20px;
     background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
     border-radius: 12px;
     color: white !important;
 }
 .header-title {
-    font-size: 2.5rem;
+    font-size: 1.9rem;
     font-weight: 800;
+    margin: 0 0 6px 0;
     color: white !important;
 }
+@media (max-width: 640px) {
+    .header-box { padding: 10px 12px; }
+    .header-title { font-size: 1.5rem; }
+    .model-card-content { gap: 4px 12px; font-size: 0.8rem; }
+    .model-card-item { flex-wrap: wrap; gap: 2px 6px; }
+}
+/* "Tải Model" button with the model status beside it */
+.model-status { align-self: center; }
+.model-status p { margin: 0; }
 .gradient-text {
     background: -webkit-linear-gradient(45deg, #60A5FA, #22D3EE);
     -webkit-background-clip: text;
@@ -83,6 +93,7 @@ css = """
 }
 .model-card-link {
     color: #60A5FA;
+    white-space: nowrap;
     text-decoration: none;
     font-weight: 500;
     transition: color 0.2s;
